@@ -1,10 +1,14 @@
 service启动流程
 
+service的start方式启动流源码梳理是基于android 9.0的,在学习的过程中参考了《android进阶揭秘》
+
 ###### 应用进程到AMS
 
 startService启动第一个跨进程通信,使用启动进程到请求AMS的流程.Activity调用startService方法,调用的是Context中定义的方法,但是这里抽象方法,他的实现类是ContextWrapper.java,在ContextWrapper.java中又调用了mBase的startService方法,mBase也是Context类型的,它是在启动Activity时进行赋值的,它的实现类为ContextImpl.java,在这里调用了ContextImpl的startService方法,然后在startServiceCommon调用ActivityManagerService,这里调用ActivityManager是通过AIDL跨进程方式实现的.
 
+调用流程图
 
+<img src="/Users/songdaren/Desktop/bookRoom/Service-start启动流程1.png" alt="Service-start启动流程1" style="zoom:80%;" />
 
 startService启动第一步调用startService
 
@@ -225,6 +229,10 @@ private ComponentName startServiceCommon(Intent service, boolean requireForegrou
 IActivityManager是一个AIDL定义的接口文件,它的具体实现类为ActivityManagerService
 
 ###### AMS到Service
+
+从AMS到启动Service的过程中是在两个进程中中处理的,AMS中启动的业务逻辑主要是在ActivityService进行处理的,处理完成之后,AMS通过应用进程的ApplicationThread进行跨进程通信,进行创建service
+
+<img src="/Users/songdaren/Desktop/bookRoom/Service-start启动流程2.png" alt="Service-start启动流程2" style="zoom:80%;" />
 
 文件所在目录: /frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
 
