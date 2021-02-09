@@ -1,8 +1,6 @@
-service启动流程
+Service的start方式启动流源码梳理是基于android 9.0的,在梳理过程考了《android进阶揭秘》,后面对这一块有新的认识会持续更新
 
-service的start方式启动流源码梳理是基于android 9.0的,在学习的过程中参考了《android进阶揭秘》
-
-###### 应用进程到AMS
+###### ContextWrapper到AMS
 
 startService启动第一个跨进程通信,使用启动进程到请求AMS的流程.Activity调用startService方法,调用的是Context中定义的方法,但是这里抽象方法,他的实现类是ContextWrapper.java,在ContextWrapper.java中又调用了mBase的startService方法,mBase也是Context类型的,它是在启动Activity时进行赋值的,它的实现类为ContextImpl.java,在这里调用了ContextImpl的startService方法,然后在startServiceCommon调用ActivityManagerService,这里调用ActivityManager是通过AIDL跨进程方式实现的.
 
@@ -336,13 +334,60 @@ bringUpServiceLocked
 文件所在目录: /frameworks/base/services/core/java/com/android/server/am/ActiveServices.java
 
 ```java
-private String bringUpServiceLocked(ServiceRecord r, int intentFlags, boolean execInFg,
+ private String bringUpServiceLocked(ServiceRecord r, int intentFlags, boolean execInFg,
             boolean whileRestarting, boolean permissionsReviewRequired)
             throws TransactionTooLargeException {
         //Slog.i(TAG, "Bring up service:");
         //r.dump("  ");
 
- 				// ...
+        if (r.app != null && r.app.thread != null) { //关键代码 1
+            sendServiceArgsLocked(r, execInFg, false);
+            return null;
+        }
+
+        if (!whileRestarting && mRestartingServices.contains(r)) {
+            // If waiting for a restart, then do nothing.
+            return null;
+        }
+
+        if (DEBUG_SERVICE) {
+            Slog.v(TAG_SERVICE, "Bringing up " + r + " " + r.intent + " fg=" + r.fgRequired);
+        }
+
+        // We are now bringing the service up, so no longer in the
+        // restarting state.
+        if (mRestartingServices.remove(r)) {
+            clearRestartingIfNeededLocked(r);
+        }
+
+        // Make sure this service is no longer considered delayed, we are starting it now.
+        if (r.delayed) {
+            if (DEBUG_DELAYED_STARTS) Slog.v(TAG_SERVICE, "REM FR DELAY LIST (bring up): " + r);
+            getServiceMapLocked(r.userId).mDelayedStartList.remove(r);
+            r.delayed = false;
+        }
+
+        // Make sure that the user who owns this service is started.  If not,
+        // we don't want to allow it to run.
+        if (!mAm.mUserController.hasStartedUserState(r.userId)) {
+            String msg = "Unable to launch app "
+                    + r.appInfo.packageName + "/"
+                    + r.appInfo.uid + " for service "
+                    + r.intent.getIntent() + ": user " + r.userId + " is stopped";
+            Slog.w(TAG, msg);
+            bringDownServiceLocked(r);
+            return msg;
+        }
+
+        // Service is now being launched, its package can't be stopped.
+        try {
+            AppGlobals.getPackageManager().setPackageStoppedState(
+                    r.packageName, false, r.userId);
+        } catch (RemoteException e) {
+        } catch (IllegalArgumentException e) {
+            Slog.w(TAG, "Failed trying to unstop package "
+                    + r.packageName + ": " + e);
+        }
 
         final boolean isolated = (r.serviceInfo.flags&ServiceInfo.FLAG_ISOLATED_PROCESS) != 0;
         final String procName = r.processName;
@@ -350,7 +395,6 @@ private String bringUpServiceLocked(ServiceRecord r, int intentFlags, boolean ex
         ProcessRecord app;
 
         if (!isolated) {
-          	//获取应用进程
             app = mAm.getProcessRecordLocked(procName, r.appInfo.uid, false);
             if (DEBUG_MU) Slog.v(TAG_MU, "bringUpServiceLocked: appInfo.uid=" + r.appInfo.uid
                         + " app=" + app);
@@ -385,7 +429,8 @@ private String bringUpServiceLocked(ServiceRecord r, int intentFlags, boolean ex
 
         // Not running -- get it started, and enqueue this service record
         // to be executed when the app comes up.
-        if (app == null && !permissionsReviewRequired) {// 启动应用进程
+        if (app == null && !permissionsReviewRequired) {
+          	// 关键代码3
             if ((app=mAm.startProcessLocked(procName, r.appInfo, true, intentFlags,
                     hostingType, r.name, false, isolated, false)) == null) {
                 String msg = "Unable to launch app "
@@ -426,9 +471,10 @@ private String bringUpServiceLocked(ServiceRecord r, int intentFlags, boolean ex
 
         return null;
     }
+
 ```
 
-在这里有个主要的判断,就是判断当前要启动的Service是否已经启动,如果已经启动就直接调用启动service的方法,如果没有启动就先去启动应用进程.这里我们只去看应用进程存在的情况就行了,就是realStartServiceLocked
+关键代码1处,判断Service是否已经启动.如果已经启动就执行onStartCommend方法,注释2 处判断应用进程是否启动,如果启动就执行realStartServiceLocked方法真正去启动Service,注释3如果应用还未启动先去启动应用进程
 
 文件所在目录: /frameworks/base/services/core/java/com/android/server/am/ActiveServices.java
 
@@ -509,7 +555,7 @@ private final void realStartServiceLocked(ServiceRecord r,
             r.pendingStarts.add(new ServiceRecord.StartItem(r, false, r.makeNextStartId(),
                     null, null, 0));
         }
-
+				// 关键代码 2
         sendServiceArgsLocked(r, execInFg, true);
 
         if (r.delayed) {
@@ -531,7 +577,7 @@ private final void realStartServiceLocked(ServiceRecord r,
 
 ```
 
-在关键代码1处调用了 app.thread.scheduleCreateService,这个thread是ApplicationThread,它是ActivityThread的内部类,是IApplicationThead的子类,使用AMS与应用进程进程通信的.
+在关键代码1处调用了 app.thread.scheduleCreateService,这个thread是ApplicationThread,它是ActivityThread的内部类,是IApplicationThead的子类,使用AMS与应用进程进程通信的.注释2执行生命周期方法的回调
 
 文件所在目录: /frameworks/base/core/java/android/app/ActivityThread.java
 
@@ -624,4 +670,182 @@ private void handleCreateService(CreateServiceData data) {
     }
 ```
 
-在这个方法里通过应用程序的LoadApk获取应用程序的描述信息,根据CreateServiceData的描述信息,通过类加载器获取Service实例,service.attach设置上下文, service.onCreate()调用onCreate方法.启动流程结束
+在这个方法里通过应用程序的LoadApk获取应用程序的描述信息,根据CreateServiceData的描述信息,通过类加载器获取Service实例,service.attach设置上下文, service.onCreate()调用onCreate方法.我们在回到ActiveServices.java的realStartServiceLocked里的调用的sendServiceArgsLocked
+
+文件所在目录: /frameworks/base/services/core/java/com/android/server/am/ActiveServices.java
+
+```java
+private final void sendServiceArgsLocked(ServiceRecord r, boolean execInFg,
+            boolean oomAdjusted) throws TransactionTooLargeException {
+        final int N = r.pendingStarts.size();
+        if (N == 0) {
+            return;
+        }
+
+        ArrayList<ServiceStartArgs> args = new ArrayList<>();
+
+        while (r.pendingStarts.size() > 0) {
+            ServiceRecord.StartItem si = r.pendingStarts.remove(0);
+            if (DEBUG_SERVICE) {
+                Slog.v(TAG_SERVICE, "Sending arguments to: "
+                        + r + " " + r.intent + " args=" + si.intent);
+            }
+            if (si.intent == null && N > 1) {
+                // If somehow we got a dummy null intent in the middle,
+                // then skip it.  DO NOT skip a null intent when it is
+                // the only one in the list -- this is to support the
+                // onStartCommand(null) case.
+                continue;
+            }
+            si.deliveredTime = SystemClock.uptimeMillis();
+            r.deliveredStarts.add(si);
+            si.deliveryCount++;
+            if (si.neededGrants != null) {
+                mAm.grantUriPermissionUncheckedFromIntentLocked(si.neededGrants,
+                        si.getUriPermissionsLocked());
+            }
+            mAm.grantEphemeralAccessLocked(r.userId, si.intent,
+                    r.appInfo.uid, UserHandle.getAppId(si.callingId));
+            bumpServiceExecutingLocked(r, execInFg, "start");
+            if (!oomAdjusted) {
+                oomAdjusted = true;
+                mAm.updateOomAdjLocked(r.app, true);
+            }
+            if (r.fgRequired && !r.fgWaiting) {
+                if (!r.isForeground) {
+                    if (DEBUG_BACKGROUND_CHECK) {
+                        Slog.i(TAG, "Launched service must call startForeground() within timeout: " + r);
+                    }
+                    scheduleServiceForegroundTransitionTimeoutLocked(r);
+                } else {
+                    if (DEBUG_BACKGROUND_CHECK) {
+                        Slog.i(TAG, "Service already foreground; no new timeout: " + r);
+                    }
+                    r.fgRequired = false;
+                }
+            }
+            int flags = 0;
+            if (si.deliveryCount > 1) {
+                flags |= Service.START_FLAG_RETRY;
+            }
+            if (si.doneExecutingCount > 0) {
+                flags |= Service.START_FLAG_REDELIVERY;
+            }
+            args.add(new ServiceStartArgs(si.taskRemoved, si.id, flags, si.intent));
+        }
+
+        ParceledListSlice<ServiceStartArgs> slice = new ParceledListSlice<>(args);
+        slice.setInlineCountLimit(4);
+        Exception caughtException = null;
+        try {
+          	// 关键代码 1
+            r.app.thread.scheduleServiceArgs(r, slice);
+        } catch (TransactionTooLargeException e) {
+            if (DEBUG_SERVICE) Slog.v(TAG_SERVICE, "Transaction too large for " + args.size()
+                    + " args, first: " + args.get(0).args);
+            Slog.w(TAG, "Failed delivering service starts", e);
+            caughtException = e;
+        } catch (RemoteException e) {
+            // Remote process gone...  we'll let the normal cleanup take care of this.
+            if (DEBUG_SERVICE) Slog.v(TAG_SERVICE, "Crashed while sending args: " + r);
+            Slog.w(TAG, "Failed delivering service starts", e);
+            caughtException = e;
+        } catch (Exception e) {
+            Slog.w(TAG, "Unexpected exception", e);
+            caughtException = e;
+        }
+
+        if (caughtException != null) {
+            // Keep nesting count correct
+            final boolean inDestroying = mDestroyingServices.contains(r);
+            for (int i = 0; i < args.size(); i++) {
+                serviceDoneExecutingLocked(r, inDestroying, inDestroying);
+            }
+            if (caughtException instanceof TransactionTooLargeException) {
+                throw (TransactionTooLargeException)caughtException;
+            }
+        }
+    }
+```
+
+这里调用的ApplicationThread的scheduleServiceArgs
+
+文件所在目录: /frameworks/base/core/java/android/app/ActivityThread.java
+
+```java
+        public final void scheduleServiceArgs(IBinder token, ParceledListSlice args) {
+            List<ServiceStartArgs> list = args.getList();
+
+            for (int i = 0; i < list.size(); i++) {
+                ServiceStartArgs ssa = list.get(i);
+                ServiceArgsData s = new ServiceArgsData();
+                s.token = token;
+                s.taskRemoved = ssa.taskRemoved;
+                s.startId = ssa.startId;
+                s.flags = ssa.flags;
+                s.args = ssa.args;
+
+                sendMessage(H.SERVICE_ARGS, s);
+            }
+        }
+```
+
+文件所在目录: /frameworks/base/core/java/android/app/ActivityThread.java
+
+```java
+ public void handleMessage(Message msg) {
+            if (DEBUG_MESSAGES) Slog.v(TAG, ">>> handling: " + codeToString(msg.what));
+            switch (msg.what) {
+                case SERVICE_ARGS:
+                    Trace.traceBegin(Trace.TRACE_TAG_ACTIVITY_MANAGER, ("serviceStart: " + String.valueOf(msg.obj)));
+                    handleServiceArgs((ServiceArgsData)msg.obj);
+                    Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+                    break;
+              
+            }
+           
+        }
+```
+
+调用了handleServiceArgs
+
+文件所在目录: /frameworks/base/core/java/android/app/ActivityThread.java
+
+```java
+  private void handleServiceArgs(ServiceArgsData data) {
+        Service s = mServices.get(data.token);
+        if (s != null) {
+            try {
+                if (data.args != null) {
+                    data.args.setExtrasClassLoader(s.getClassLoader());
+                    data.args.prepareToEnterProcess();
+                }
+                int res;
+                if (!data.taskRemoved) {// 调用了Service.onStartCommand
+                    res = s.onStartCommand(data.args, data.flags, data.startId);
+                } else {
+                    s.onTaskRemoved(data.args);
+                    res = Service.START_TASK_REMOVED_COMPLETE;
+                }
+
+                QueuedWork.waitToFinish();
+
+                try {
+                    ActivityManager.getService().serviceDoneExecuting(
+                            data.token, SERVICE_DONE_EXECUTING_START, data.startId, res);
+                } catch (RemoteException e) {
+                    throw e.rethrowFromSystemServer();
+                }
+                ensureJitEnabled();
+            } catch (Exception e) {
+                if (!mInstrumentation.onException(s, e)) {
+                    throw new RuntimeException(
+                            "Unable to start service " + s
+                            + " with " + data.args + ": " + e.toString(), e);
+                }
+            }
+        }
+    }
+```
+
+这里调用了onStartCommand,到这里整个完整的生命周期就走完了.
